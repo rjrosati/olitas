@@ -1,6 +1,6 @@
 using Plots
 import SpecialFunctions: beta_inc
-import FFTW: rfft, rfftfreq
+import FFTW: rfft, irfft
 
 function ν(x, n::Int = 4)
     # beta_inc(a,b,x,y=1-x)
@@ -28,8 +28,6 @@ end
     Nf::Int
     Nt::Int
     dt::Float64 # timeseries sampling period
-    #time_pixel_duration::Float64 = 7680.0
-    #bandwidth::Float64 = 0.0
     N::Int = Nt*Nf
     T::Int = dt*N
     ΔT::Float64 = Nf*dt # width of one pixel in time
@@ -54,14 +52,29 @@ function print_wdm_info(wdm::WDMInfo)
     println("Meyer window shape: A/ΔΩ=$(wdm.A/wdm.ΔΩ), n = $(wdm.n)")
     println("================================")
 end
+function wavelet_transform_freq(fftdata, wdm::WDMInfo)
+    w = zeros((wdm.Nt, wdm.Nf))
+    for m in 1:(wdm.Nf+1) 
+        Cnm = (n+m)%2 ? im : 1
+        # set up to make this time layer
+        X = zeros(eltype(fftdata), wdm.Nt)
+        center = (m-1)*Nt//2 + 1
+        for j in range(-wdm.Nt//2 + 1, wdm.Nt//2)
+            freq_index = center + j
+            if m == 0
+        xm[n] = ifft()
+        w[n,m] .= sqrt(2)*(-1)^(n*m)*real(Cnm*xm[n])
+    end
 
-function wavelet_transform(timeseries, wdm::WDMInfo)
+end
+
+function wavelet_transform_timefreq(timeseries, wdm::WDMInfo)
     # this is not the actual time transform, we convert to freq first
     if length(timeseries) != wdm.N
         error("attempted WDM transform with data of length $(length(timeseries)), while WDMInfo is setup for N=$(wdm.N)")
     end
     X = rfft(timeseries)
-    return X
+    return wavelet_transform_freq(X, wdm)
 end
 
 function demo()
