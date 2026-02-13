@@ -1,6 +1,21 @@
 using Plots
 import SpecialFunctions: beta_inc
-import FFTW: rfft, irfft
+import FFTW: rfft, irfft, fft, ifft
+import UnicodePlots: lineplot
+
+@kwdef struct WDMInfo
+    Nf::Int
+    Nt::Int
+    dt::Float64 # timeseries sampling period
+    N::Int = Nt*Nf
+    T::Int = dt*N
+    ΔT::Float64 = Nf*dt # width of one pixel in time
+    ΔF::Float64 = 1/(2dt*Nf) # height of one pixel in freq 
+    ΔΩ::Float64 = 2π*ΔF
+    A::Float64 = 0 # Meyer shape parameter. note can't be bigger than ΔΩ/2
+    n::Int = 4 # Window rolloff parameter
+
+end
 
 function ν(x, n::Int = 4)
     # beta_inc(a,b,x,y=1-x)
@@ -24,48 +39,118 @@ function g(ω, m, n, wdm::WDMInfo)
     return exp(-im*n*ω*wdm.ΔT)*(Cnm*ϕ(ω-m*wdm.ΔΩ, wdm) + conj(Cnm)*ϕ(ω+m*wdm.ΔΩ, wdm))
 end
 
-@kwdef struct WDMInfo
-    Nf::Int
-    Nt::Int
-    dt::Float64 # timeseries sampling period
-    N::Int = Nt*Nf
-    T::Int = dt*N
-    ΔT::Float64 = Nf*dt # width of one pixel in time
-    ΔF::Float64 = 1/(2dt*Nf) # height of one pixel in freq 
-    ΔΩ::Float64 = 2π*ΔF
-    A::Float64 = 0 # Meyer shape parameter. note can't be bigger than ΔΩ/2
-    n::Int = 4 # Window rolloff parameter
-
-end
 function ϕ(ω, wdm::WDMInfo)
     return ϕ(ω, wdm.ΔΩ, wdm.A, wdm.n)
 end
 
 function print_wdm_info(wdm::WDMInfo)
-    println("======== WDM Basis Info ========")
+    println("================ WDM Basis Info ================")
     println("Nt: $(wdm.Nt)")
     println("Nf: $(wdm.Nf)")
     println("N:  $(wdm.N)")
     println("dt: $(wdm.dt)")
     println("Pixel duration:  $(wdm.ΔT)")
     println("Pixel bandwidth: $(wdm.ΔF)")
-    println("Meyer window shape: A/ΔΩ=$(wdm.A/wdm.ΔΩ), n = $(wdm.n)")
-    println("================================")
+    println("Meyer window shape: A/ΔΩ = $(wdm.A/wdm.ΔΩ), n = $(wdm.n)")
+    ωs = range(-wdm.ΔΩ, wdm.ΔΩ, length=100)
+    phis = [ϕ(ωi,wdm) for ωi in ωs]
+    plt = lineplot(ωs ./ wdm.ΔΩ, phis, xlabel="ω/ΔΩ", ylabel="ϕ(ω)")
+    println(plt)
+    println("================================================")
 end
+
+function build_filter(wdm::WDMInfo; forward=true)
+    omegas = 2π / wdm.N .* (0:(wdm.Nt÷2))
+    phif = [ϕ(om, wdm) for om in omegas]
+    nrm = sqrt( (2sum(phif[2:end].^2) + phif[1]^2) * 2/wdm.N)
+    phif ./= nrm
+    if forward
+        phif .=* 2.0/wdm.Nf
+    end
+    phif
+end
+function inverse_wavelet_transform_freq(w, wdm::WDMInfo)
+    if size(w) != (wdm.Nt, wdm.Nf)
+        error("Input wavelet array dimensions $(size(w)) don't match given WDMInfo. (Nt=$(wdm.Nt), Nf=$(wdm.Nf))")
+    end
+    phif = build_filter(wdm,forward=false)
+    out = zeros(Complex{eltype(w)}, wdm.N÷2 + 1)
+    for m in 1:(wdm.Nf+1)
+        center = (m-1)*(wdm.Nt÷2) + 1
+        # repack time layers into a complex array 
+        prefactors = zeros(Complex{eltype(w)}, wdm.Nt)
+        for n in 1:wdm.Nt
+            if m==1
+                prefactors[n] = w[(2n)%wdm.Nt+1, 1]/sqrt(2)
+            elseif m==wdm.Nf+1
+                prefactors[n] = w[(2n)%wdm.Nt+2, 1]/sqrt(2)
+            else
+                prefactors[n] = (n+m)%2 == 0 ? w[n,m] : -im*w[n,m]
+            end
+        end
+        fft_result = fft(prefactors)
+        imin = max(center-wdm.Nt÷2 + 1, 1)
+        imax = min(center+wdm.Nt÷2, wdm.N÷2 + 1)
+        for i in imin:imax
+            # TODO: check off-by-one issues
+            iind = abs(i-center) + 1
+            if iind > wdm.Nt÷2
+                continue
+            end
+            if m==1 || m==(wdm.Nf+1)
+                fft_result[i] += fft_result[(2i) % wdm.Nt + 1] * phif[iind]
+            else
+                fft_result[i] += fft_result[i % wdm.Nt + 1] * phif[iind]
+            end
+        end
+    end
+    return fft_result
+end
+
 function wavelet_transform_freq(fftdata, wdm::WDMInfo)
     w = zeros((wdm.Nt, wdm.Nf))
-    for m in 1:(wdm.Nf+1) 
-        Cnm = (n+m)%2 ? im : 1
+    phif = build_filter(wdm)
+    Nthalf = wdm.Nt÷2
+    for m in 1:(wdm.Nf+1)
+        center = (m-1)*Nthalf # +1?
+        #Cnm = (n+m)%2 ? im : 1
         # set up to make this time layer
         X = zeros(eltype(fftdata), wdm.Nt)
-        center = (m-1)*Nt//2 + 1
-        for j in range(-wdm.Nt//2 + 1, wdm.Nt//2)
-            freq_index = center + j
-            if m == 0
-        xm[n] = ifft()
-        w[n,m] .= sqrt(2)*(-1)^(n*m)*real(Cnm*xm[n])
+        for j in range(-Nthalf, Nthalf-1)
+            freq_index = center + j + 1
+            # no negative freqs of DC, nor anything above Nyquist
+            if (m == 1 && freq_index < 1) || (m == wdm.Nf && freq_index > 1)
+                continue
+            end
+            weight = phif[abs(j)+1]
+            if j == 1
+                # boundary layers have less dof
+                weight /= 2
+            end
+            # TODO check index math
+            X[Nthalf + j + 1] = weight * fftdata[freq_index]
+        end
+        xm = ifft(X)
+        # extract wavelet coefficients
+        # for the edge layers, there are only half the d.o.f.
+        # make the same choice as Matt's code and pack DC and Nyquist into first layer
+        if m == 1
+            w[1:2:end,1] .= real.(xm[1:2:end]) .* sqrt(2.0)
+        elseif m == wdm.Nf+1
+            w[2:2:end,1] .= real.(xm[1:2:end]) .* sqrt(2.0)
+        else
+            # general layer
+            for n in 1:wdm.Nt
+                if (n+m)%2 == 0
+                    w[n,m] = real(xm[n])
+                else
+                    s = m % 2 == 0 ? 1 : -1
+                    w[n,m] = s*imag(xm[n])
+                end
+            end
+        end
     end
-
+    return w
 end
 
 function wavelet_transform_timefreq(timeseries, wdm::WDMInfo)
@@ -79,22 +164,24 @@ end
 
 function demo()
     wdm = WDMInfo(
-                  Nf = 1536,
-                  Nt = 7,
+                  #Nf = 1536,
+                  #Nt = 7,
+                  Nf = 2,
+                  Nt = 2,
                   #Nf = 100,
                   #Nt = 100,
                   dt = 5.0
                  )
     print_wdm_info(wdm)
-    #=
-    ωs = range(-5wdm.ΔΩ,5wdm.ΔΩ,length=100)
-    phis = [ϕ(ωi,wdm) for ωi in ωs]
-    plot(ωs, phis)
-    gui()
-    =#
 
     testdata = zeros(wdm.N)
     testdata[1] = 1.0
-    wavelet_transform(testdata, wdm)
+    X = rfft(testdata)
 
+    w = wavelet_transform_freq(X, wdm)
+    Xp = inverse_wavelet_transform_freq(w, wdm)
+    timeseries_out = irfft(Xp)
+
+    println("average roundtrip error per element (freq): $(sum(abs.(real.(X) - real.(Xp)) .+ abs.(imag.(X) - imag.(Xp)))/length(X))")
+    println("average roundtrip error per element (time): $(sum(abs.(testdata-testdata_out))/length(testdata))")
 end
